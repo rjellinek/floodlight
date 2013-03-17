@@ -16,6 +16,8 @@ import org.openflow.protocol.OFPort;
 import org.openflow.protocol.OFType;
 import org.openflow.protocol.action.OFAction;
 import org.openflow.protocol.action.OFActionOutput;
+import org.openflow.protocol.action.OFActionTransportLayerDestination;
+import org.openflow.protocol.action.OFActionTransportLayerSource;
 import org.openflow.util.U16;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -48,7 +50,7 @@ public class LearningSwitch implements IOFMessageListener, IFloodlightModule, IO
 	
 	// 0 - NOTHING, 1 - HUB, 2 - LEARNING_SWITCH_WO_RULES, 3 - LEARNING_SWITCH_WITH_RULES
 	// 4 - LEARNING_SWITCH_WITH_FIREWALL, 5 - LEARNING_SWITCH_WITH_NAT
-	protected static int CTRL_LEVEL = 4;
+	protected static int CTRL_LEVEL = 5;
     protected static short FLOWMOD_DEFAULT_IDLE_TIMEOUT = 20; // in seconds
     protected static short FLOWMOD_DEFAULT_HARD_TIMEOUT = 0; // infinite
 	
@@ -135,7 +137,7 @@ public class LearningSwitch implements IOFMessageListener, IFloodlightModule, IO
                 
         // define the actions to apply for this packet
         OFActionOutput action = new OFActionOutput();
-		action.setPort(outport);		
+		action.setPort(outport);
 		po.setActions(Collections.singletonList((OFAction)action));
 		po.setActionsLength((short)OFActionOutput.MINIMUM_LENGTH);
 	        
@@ -156,6 +158,275 @@ public class LearningSwitch implements IOFMessageListener, IFloodlightModule, IO
         } catch (IOException e) {
             logger.error("failed to write packetOut: ", e);
         }
+	}	
+	
+	/*
+	 * push a packet-out to the switch
+	 * */
+	private void pushPacketRemap(IOFSwitch sw, OFMatch match, OFPacketIn pi, short outport) {
+		
+		// create an OFPacketOut for the pushed packet
+        OFPacketOut po = (OFPacketOut) floodlightProvider.getOFMessageFactory()
+                		.getMessage(OFType.PACKET_OUT);        
+        
+        // update the inputPort and bufferID
+        po.setInPort(pi.getInPort());
+        po.setBufferId(pi.getBufferId());
+                
+        ArrayList<OFAction> actions = new ArrayList<OFAction>();
+        
+        // define the actions to apply for this packet
+        OFActionOutput action = new OFActionOutput();
+		action.setPort(outport);
+		OFActionTransportLayerDestination remap = new OFActionTransportLayerDestination((short)443);
+		
+		actions.add(action);
+		actions.add(remap);
+		
+		po.setActions(actions);
+		po.setActionsLength((short)(OFActionOutput.MINIMUM_LENGTH + OFActionTransportLayerDestination.MINIMUM_LENGTH));
+	        
+        // set data if it is included in the packet in but buffer id is NONE
+        if (pi.getBufferId() == OFPacketOut.BUFFER_ID_NONE) {
+            byte[] packetData = pi.getPacketData();
+            po.setLength(U16.t(OFPacketOut.MINIMUM_LENGTH
+                    + po.getActionsLength() + packetData.length));
+            po.setPacketData(packetData);
+        } else {
+            po.setLength(U16.t(OFPacketOut.MINIMUM_LENGTH
+                    + po.getActionsLength()));
+        }        
+        
+        // push the packet to the switch
+        try {
+            sw.write(po, null);
+        } catch (IOException e) {
+            logger.error("failed to write packetOut: ", e);
+        }
+	}	
+		
+	private Command ctrlLogicWithNAT(IOFSwitch sw, OFPacketIn pi) {
+        logger.debug("Controller called");
+
+		ArrayList<OFAction> actions = new ArrayList<OFAction>();
+		
+        // Read in packet data headers by using an OFMatch structure
+        OFMatch match = new OFMatch();
+        match.loadFromPacket(pi.getPacketData(), pi.getInPort());		
+        
+		// take the source and destination mac from the packet
+		Long sourceMac = Ethernet.toLong(match.getDataLayerSource());
+        Long destMac   = Ethernet.toLong(match.getDataLayerDestination());
+        
+        Short inputPort = pi.getInPort();
+        
+        // if the (sourceMac, port) does not exist in MAC table
+        // 		add a new entry
+        if (!macToPort.containsKey(sourceMac)) 
+        	macToPort.put(sourceMac, inputPort);
+       
+        // if the destMac is in the MAC table take the outPort and send it there
+        Short outPort = macToPort.get(destMac);
+        logger.debug("outPort: {}", outPort);
+                
+        // TODO: If packet is 80 or 443, remap and install rule
+        // Fall through and do Learning Switch rules.
+        if (match.getTransportDestination() == (short)80) {
+            logger.debug("Installing NAT rule");
+
+ 			// specify that all fields except destMac to be wildcarded
+ 			match.setWildcards(~(OFMatch.OFPFW_DL_TYPE | OFMatch.OFPFW_NW_PROTO | OFMatch.OFPFW_TP_DST | OFMatch.OFPFW_DL_DST));
+ 			match.setDataLayerType((short)0x0800); // set ethernet
+ 			match.setNetworkProtocol(IPv4.PROTOCOL_TCP);
+ 			match.setTransportDestination((short)80);
+ 			        	
+ 			// Only insert a rule in the forward direction if we know where to 
+        	// forward it 
+        	if (outPort != null) {
+                logger.debug("Installing NAT rule in forward direction.");
+
+        		OFFlowMod rule = new OFFlowMod();
+     			rule.setType(OFType.FLOW_MOD); 			
+     			rule.setCommand(OFFlowMod.OFPFC_ADD);
+    
+     			rule.setMatch(match);
+        		
+	 			// action: rewrite destination TCP port to 443
+	 			OFAction rewrite = new OFActionTransportLayerDestination((short)443);
+	 			
+	 			// If we have the output port, we add a rule to forward. Otherwise
+	 			// we need to flood it to 443 and we can only add the rule to always send 
+	 			// out the correct port once we have that port in our table.
+	 			OFAction forward = new OFActionOutput(outPort);
+	 			
+	 			actions.add(rewrite);
+	 			actions.add(forward); 
+	 			
+				rule.setLength((short)(OFFlowMod.MINIMUM_LENGTH + OFActionOutput.MINIMUM_LENGTH + OFActionTransportLayerDestination.MINIMUM_LENGTH)); 
+	 			
+	 			rule.setPriority((short)3);
+	 			rule.setActions(actions);
+	 			
+	 	        // set the buffer id to NONE - implementation artifact
+	 			rule.setBufferId(OFPacketOut.BUFFER_ID_NONE);
+	
+	 			try {
+	 				sw.write(rule, null);
+	 				sw.flush();
+	 			} catch (Exception e) {
+	 				e.printStackTrace();
+	 			}
+        	}
+        	else {
+                logger.debug("Installing NAT rule in reverse direction");
+
+	 			// Now install reverse list with a fresh match
+	 			OFFlowMod rule = new OFFlowMod();
+	 			actions.clear();
+	 			OFMatch reverseMatch = new OFMatch();
+	 			//reverseMatch.setWildcards(~(OFMatch.OFPFW_DL_TYPE | OFMatch.OFPFW_NW_PROTO | OFMatch.OFPFW_TP_SRC | OFMatch.OFPFW_TP_DST));
+	 			reverseMatch.setWildcards(~(OFMatch.OFPFW_DL_TYPE | OFMatch.OFPFW_NW_PROTO | OFMatch.OFPFW_TP_SRC | OFMatch.OFPFW_DL_DST));
+	 			reverseMatch.setDataLayerType((short)0x0800); // set ethernet
+	 			reverseMatch.setDataLayerDestination(match.getDataLayerSource());
+	 			reverseMatch.setDataLayerSource(match.getDataLayerDestination());
+	 			reverseMatch.setNetworkProtocol(IPv4.PROTOCOL_TCP);
+	 			reverseMatch.setTransportSource((short)443);
+	 			rule.setMatch(reverseMatch);
+	 			
+	 			// send back to wherever we got it from (high garbage port on netcat), not to 80
+	 			//OFAction rewriteDst = new OFActionTransportLayerDestination(match.getTransportSource());
+	 			//actions.add(rewriteDst);
+	 			
+	 			// rewrite TCP src so it looks like pkt is coming from port 80
+	 			OFAction rewriteSrc = new OFActionTransportLayerSource((short)80);
+	 			actions.add(rewriteSrc);
+	 			
+	 			// forward to our original input interface
+	 			OFAction forward = new OFActionOutput(inputPort);
+	 			actions.add(forward);
+	 			
+	 			rule.setActions(actions);
+	 			
+				rule.setLength((short)(OFFlowMod.MINIMUM_LENGTH + OFActionOutput.MINIMUM_LENGTH 
+						+ OFActionTransportLayerSource.MINIMUM_LENGTH)); 
+	 			rule.setPriority((short)3);
+	 			
+	 	        // set the buffer id to NONE - implementation artifact
+	 			rule.setBufferId(OFPacketOut.BUFFER_ID_NONE);
+	 			
+				try {
+	 				sw.write(rule, null);
+	 				sw.flush();
+	 			} catch (Exception e) {
+	 				e.printStackTrace();
+	 			}
+        	}
+        	
+            if (match.getTransportDestination() == (short)80) {
+            	this.pushPacketRemap(sw, match, pi, (short)OFPort.OFPP_FLOOD.getValue());
+            }
+			
+ 			return Command.CONTINUE;
+        }
+        
+        // if an entry does exist for destMac
+        //		flood the packet
+        if (outPort == null) 
+        	this.pushPacket(sw, match, pi, (short)OFPort.OFPP_FLOOD.getValue());                	
+        else {
+    	        	
+	    	// otherwise install a rule s.t. all the traffic with the destination
+	        // destMac should be forwarded on outPort
+        		            
+        	// create the rule and specify it's an ADD rule
+        	OFFlowMod rule = new OFFlowMod();
+ 			rule.setType(OFType.FLOW_MOD); 			
+ 			rule.setCommand(OFFlowMod.OFPFC_ADD);
+ 			
+ 			// specify that all fields except destMac to be wildcarded
+ 			match.setWildcards(~OFMatch.OFPFW_DL_DST);
+ 			//match.setDataLayerDestination(match.getDataLayerDestination());
+ 			rule.setMatch(match);
+ 			
+ 			// specify timers for the life of the rule
+ 			rule.setIdleTimeout(LearningSwitch.FLOWMOD_DEFAULT_IDLE_TIMEOUT);
+ 			rule.setHardTimeout(LearningSwitch.FLOWMOD_DEFAULT_HARD_TIMEOUT);
+ 			rule.setPriority((short)2);
+ 	        
+ 	        // set the buffer id to NONE - implementation artifact
+ 			rule.setBufferId(OFPacketOut.BUFFER_ID_NONE);
+ 	       
+ 	        // set of actions to apply to this rule
+// 			ArrayList<OFAction> actions = new ArrayList<OFAction>();
+ 			OFAction outputTo = new OFActionOutput(outPort);
+ 			actions.add(outputTo);
+ 			rule.setActions(actions);
+ 			 			
+		    rule.setLength((short)(OFFlowMod.MINIMUM_LENGTH + OFActionOutput.MINIMUM_LENGTH)); 
+ 			rule.setPriority((short)3);
+ 	        
+ 				
+ 			logger.debug("install rule for destination {}", destMac);
+ 			
+ 			try {
+ 				sw.write(rule, null);
+ 			} catch (Exception e) {
+ 				e.printStackTrace();
+ 			}	
+        
+        // push the packet to the switch	
+        	this.pushPacket(sw, match, pi, outPort);        	
+        }       
+        
+        return Command.CONTINUE;
+	}
+	
+	private void remapPortsStaticRule(IOFSwitch sw) {
+    	logger.debug("Remap port!");
+	    // Read in packet data headers by using an OFMatch structure
+	    OFMatch match = new OFMatch();
+	    //match.loadFromPacket(pi.getPacketData(), pi.getInPort());
+     
+		// create the rule and specify it's an ADD rule
+    	OFFlowMod rule = new OFFlowMod();
+		rule.setType(OFType.FLOW_MOD); 			
+		rule.setCommand(OFFlowMod.OFPFC_ADD);
+				
+		// specify that all fields except destMac to be wildcarded
+		match.setWildcards(~(OFMatch.OFPFW_NW_PROTO | OFMatch.OFPFW_DL_TYPE | OFMatch.OFPFW_TP_DST));
+		match.setDataLayerType((short)0x0800); // set ethernet
+		match.setNetworkProtocol(IPv4.PROTOCOL_TCP);
+		match.setTransportDestination((short)80);
+		rule.setMatch(match);
+		
+		// specify timers for the life of the rule
+		//rule.setIdleTimeout(LearningSwitch.FLOWMOD_DEFAULT_IDLE_TIMEOUT);
+		//rule.setHardTimeout(LearningSwitch.FLOWMOD_DEFAULT_HARD_TIMEOUT);
+		//rule.setPriority((short)40000);
+		rule.setPriority((short)2);
+		rule.setIdleTimeout((short)0);
+		rule.setHardTimeout((short)0);
+        
+        // set the buffer id to NONE - implementation artifact
+		rule.setBufferId(OFPacketOut.BUFFER_ID_NONE);
+		 			
+        // set of actions to apply to this rule
+		ArrayList<OFAction> actions = new ArrayList<OFAction>();
+		OFAction outputTo = new OFActionOutput(OFPort.OFPP_CONTROLLER.getValue());
+		actions.add(outputTo);
+		rule.setActions(actions);
+		 			
+		// specify the length of the flow structure created
+		rule.setLength((short) (OFFlowMod.MINIMUM_LENGTH + OFActionOutput.MINIMUM_LENGTH));
+		
+		try {
+			sw.write(rule, null);
+		} catch (Exception e) {
+			e.printStackTrace();
+		}	
+
+    // push the packet to the switch	
+    //	this.pushPacket(sw, match, pi, match.getDataLayerDestination());   
 	}
 	
 	private void setFirewallRuleUDP(IOFSwitch sw) {
@@ -178,7 +449,7 @@ public class LearningSwitch implements IOFMessageListener, IFloodlightModule, IO
 		// specify timers for the life of the rule
 		//rule.setIdleTimeout(LearningSwitch.FLOWMOD_DEFAULT_IDLE_TIMEOUT);
 		//rule.setHardTimeout(LearningSwitch.FLOWMOD_DEFAULT_HARD_TIMEOUT);
-		//rule.setPriority((short)40000);
+		rule.setPriority((short)1);
 		rule.setIdleTimeout((short)0);
 		rule.setHardTimeout((short)0);
         
@@ -216,6 +487,7 @@ public class LearningSwitch implements IOFMessageListener, IFloodlightModule, IO
 		// specify timers for the life of the rule
 		//rule.setIdleTimeout(LearningSwitch.FLOWMOD_DEFAULT_IDLE_TIMEOUT);
 		//rule.setHardTimeout(LearningSwitch.FLOWMOD_DEFAULT_HARD_TIMEOUT);
+		rule.setPriority((short)1);
 		rule.setIdleTimeout((short)0);
 		rule.setHardTimeout((short)0);
         
@@ -273,7 +545,7 @@ public class LearningSwitch implements IOFMessageListener, IFloodlightModule, IO
         	OFFlowMod rule = new OFFlowMod();
  			rule.setType(OFType.FLOW_MOD); 			
  			rule.setCommand(OFFlowMod.OFPFC_ADD);
- 			rule.setPriority((short)20000);
+ 			rule.setPriority((short)1);
  			
  			/* XXX: 
  			 * So right now, we're wildcarding the NW_PROTO, which means we'll have
@@ -494,6 +766,8 @@ public class LearningSwitch implements IOFMessageListener, IFloodlightModule, IO
 					return this.ctrlLogicWithRules(sw, (OFPacketIn) msg);
 				else if (LearningSwitch.CTRL_LEVEL == 4)
 					return this.ctrlLogicWithFirewall(sw, (OFPacketIn) msg);
+				else if (LearningSwitch.CTRL_LEVEL == 5)
+					return this.ctrlLogicWithNAT(sw, (OFPacketIn)msg);
 			default:
 				break;
        }
@@ -516,6 +790,8 @@ public class LearningSwitch implements IOFMessageListener, IFloodlightModule, IO
         	this.setFirewallRuleTelnet(sw);
       //      return Command.CONTINUE;
       // }
+        	
+        	this.remapPortsStaticRule(sw);
         
 	}
 
